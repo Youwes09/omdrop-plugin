@@ -528,8 +528,7 @@ identity_unlock() { exec 8>&-; }
 identity_notice() {
   local msg=$1
   printf '%s\n' "$msg" >&2
-  command -v omarchy-notification-send >/dev/null 2>&1 \
-    && omarchy-notification-send -t 8000 "Omdrop" "$msg" >/dev/null 2>&1
+  notify -t 8000 "Omdrop" "$msg" >/dev/null 2>&1
   return 0
 }
 
@@ -2275,6 +2274,52 @@ is_link_file() { case "${1,,}" in *.url|*.webloc) return 0 ;; esac; return 1; }
 # setsid-detached child with it, which is why an opened image vanished before
 # it could map a window. uwsm-app puts the app in its own unit in app.slice,
 # which is what the rest of Omarchy does (see omarchy-launch-browser).
+# Omarchy's helpers where they are installed, and the freedesktop tools every
+# other desktop has where they are not.
+#
+# notify [-t MS] SUMMARY BODY [--image FILE] [--exec CMD...]: Omarchy's
+# notification-send takes --image and --exec (run when the toast is clicked).
+# notify-send has neither, so the image goes as the image-path hint and the
+# click as the default action, waited for in its own unit: the watcher that
+# announces an arrival can be stopped before anyone clicks. Without
+# --expand-environment=no, systemd would substitute the script's own $ variables.
+notify() {
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send "$@"
+    return
+  fi
+  command -v notify-send >/dev/null 2>&1 || return 1
+  local args=(-a Omdrop) run=()
+  while (( $# )); do
+    case "$1" in
+      --image) args+=(--hint "string:image-path:$2"); shift 2 ;;
+      --exec)  shift; run=("$@"); break ;;
+      *)       args+=("$1"); shift ;;
+    esac
+  done
+  (( ${#run[@]} )) || { notify-send "${args[@]}"; return; }
+  systemd-run --user --quiet --collect --expand-environment=no -- bash -c \
+    'n=$1; shift; a=("${@:1:n}"); shift "$n"
+     [[ "$(notify-send "${a[@]}" --action=default=Open --wait)" == default ]] && exec "$@"' \
+    _ "${#args[@]}" "${args[@]}" "${run[@]}"
+}
+
+open_url() {
+  if command -v omarchy-launch-browser >/dev/null 2>&1; then
+    omarchy-launch-browser "$1"
+  else
+    launch xdg-open "$1"
+  fi
+}
+
+default_terminal() {
+  if command -v omarchy-default-terminal >/dev/null 2>&1; then
+    omarchy-default-terminal
+  else
+    printf '%s\n' "${TERMINAL:-xdg-terminal-exec}"
+  fi
+}
+
 launch() {
   # Synchronously, and NOT backgrounded: uwsm-app returns once the app has its
   # own unit, and we must still be alive at that moment. Backgrounding it and
@@ -2303,7 +2348,7 @@ act_open() {
 cmd_open_link() {
   local f=${1:?usage: omdrop open-link FILE} url raw why
   if url=$(link_target "$f"); then
-    omarchy-launch-browser "$url" >/dev/null 2>&1
+    open_url "$url" >/dev/null 2>&1
     return
   fi
   if raw=$(link_url "$f") && [[ "$raw" == *:* ]]; then
@@ -2311,7 +2356,7 @@ cmd_open_link() {
   else
     why="There is no web link in it."
   fi
-  omarchy-notification-send "Can't open $(basename "$f")" "$why" >/dev/null 2>&1 \
+  notify "Can't open $(basename "$f")" "$why" >/dev/null 2>&1 \
     || echo "omdrop: can't open $f: $why" >&2
   return 1
 }
@@ -2606,7 +2651,7 @@ act_notify() {
   # claiming the urgency of one.
   local what="Saved to $(tildify "$(dirname "$f")")/"
   command -v wl-copy >/dev/null 2>&1 && what="Copied to clipboard, saved to $(tildify "$(dirname "$f")")/"
-  omarchy-notification-send -t 8000 "$(basename "$f")" "$what (or click this)" \
+  notify -t 8000 "$(basename "$f")" "$what (or click this)" \
     "${args[@]}" --exec "$SELF" act open "$f" >/dev/null \
     || echo "omdrop: notification failed for $f" >&2
 }
@@ -2619,7 +2664,7 @@ cmd_act() {
   local dir; dir=$(dirname "$f")
   case "$what" in
     open)   act_open "$f" ;;
-    shell)  ( cd "$dir" && launch "$(omarchy-default-terminal)" ) ;;
+    shell)  ( cd "$dir" && launch "$(default_terminal)" ) ;;
     browse) launch xdg-open "$dir" ;;
     *) die "act $what: one of open, shell, browse" ;;
   esac
