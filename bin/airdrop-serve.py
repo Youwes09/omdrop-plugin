@@ -58,7 +58,7 @@ UNSAFE_CHAR = re.compile(r'[/\\\x00]|[\u202a-\u202e\u2066-\u2069\u200b-\u200f\uf
 # convenience for writing a value, not what makes it safe. Reload = restart.
 CONFIG_PATH = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.config'),
                            'airdrop', 'config.toml')
-CONFIG_KEYS = ('name', 'model', 'download_dir', 'max_receive_percent')
+CONFIG_KEYS = ('name', 'model', 'download_dir', 'max_receive_percent', 'ask')
 STRING_CONFIG_KEYS = ('name', 'model', 'download_dir')
 DEFAULT_MAX_RECEIVE_PERCENT = 30
 
@@ -91,6 +91,8 @@ def load_config(path):
             raise SystemExit(f'{path}: {k} must be a non-empty string')
     if 'max_receive_percent' in cfg:
         validate_receive_percent(cfg['max_receive_percent'])
+    if 'ask' in cfg and not isinstance(cfg['ask'], bool):
+        raise SystemExit(f'{path}: ask must be true or false')
     return cfg
 
 
@@ -134,7 +136,7 @@ def validate_download_dir(path):
 
 ap = argparse.ArgumentParser(
     description=f'AirDrop receiver. Config: {CONFIG_PATH} '
-                '(name, model, download_dir, max_receive_percent); flags override.')
+                '(name, model, download_dir, max_receive_percent, ask); flags override.')
 ap.add_argument('--iface', default='awdl0')
 ap.add_argument('--port', type=int, default=8771)
 ap.add_argument('--name', default=None,
@@ -160,6 +162,9 @@ DEST = validate_download_dir(_outdir)
 MAX_RECEIVE_PERCENT = validate_receive_percent(
     args.max_receive_percent if args.max_receive_percent is not None
     else _cfg.get('max_receive_percent', DEFAULT_MAX_RECEIVE_PERCENT))
+# ask = true: a transfer from anyone not in the known-senders list waits for the
+# person to answer it (see ask_person), instead of being accepted outright.
+ASK = _cfg.get('ask', False)
 
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout,
                     format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -170,6 +175,75 @@ with open(f'/sys/class/net/{args.iface}/address') as f:
 
 # Threaded because sharingd opens several connections at once; a
 # single-threaded server would hold /Discover behind a stalled one.
+ASK_DIR = os.path.join(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}', 'omdrop', 'asks')
+ASK_SECONDS = 30
+# Each pending Ask holds a connection and puts a request in front of the
+# person; more than a few at once is a flood, not a sender.
+MAX_PENDING_ASKS = 4
+ASK_SLOTS = threading.BoundedSemaphore(MAX_PENDING_ASKS)
+
+
+def ask_person(ask, files, items, hashes):
+    """Hold an Ask until the person answers it, and return the answer.
+
+    The request goes to ASK_DIR as ID.json (with the sender's preview as
+    ID.jp2, the JPEG 2000 an iPhone sends); whatever shows it writes "accept",
+    "always" or "decline" to ID.answer. "always" also means the shower adds
+    the sender's identifiers to the known-senders list, which this sandbox
+    cannot write; they are offered as `hashes` only when the sender proved them
+    (an Apple-signed record bound to its certificate). No answer within
+    ASK_SECONDS returns "unanswered", which declines too: the sender keeps
+    waiting meanwhile, as it would for a Mac's prompt. Sender name and file
+    names are the sender's own words.
+    """
+    import uuid
+    aid = uuid.uuid4().hex
+    base = os.path.join(ASK_DIR, aid)
+    deadline = time.time() + ASK_SECONDS
+    icon = ask.get('FileIcon')
+    request = {
+        'id': aid,
+        'sender': str(ask.get('SenderComputerName') or ''),
+        'model': str(ask.get('SenderModelName') or ''),
+        'files': [{'name': str(f.get('FileName') or ''), 'type': str(f.get('FileType') or ''),
+                   'size': f.get('FileSize') if isinstance(f.get('FileSize'), int) else None}
+                  for f in files],
+        'links': [i for i in items if isinstance(i, str)],
+        'icon': base + '.jp2' if isinstance(icon, bytes) else None,
+        'hashes': sorted(hashes),
+        'deadline': deadline,
+    }
+    try:
+        os.makedirs(ASK_DIR, mode=0o700, exist_ok=True)
+        if request['icon']:
+            with open(request['icon'], 'wb') as f:
+                f.write(icon)
+        # Written last and renamed into place: a watcher sees a whole request.
+        with open(base + '.tmp', 'w') as f:
+            json.dump(request, f)
+        os.replace(base + '.tmp', base + '.json')
+    except OSError as e:
+        logging.error('ask: could not write the request to %s: %s; declining', ASK_DIR, e)
+        return 'decline'
+    try:
+        while time.time() < deadline:
+            try:
+                with open(base + '.answer') as f:
+                    answer = f.read().strip()
+                if answer in ('accept', 'always', 'decline'):
+                    return answer
+            except FileNotFoundError:
+                pass
+            time.sleep(0.25)
+        return 'unanswered'
+    finally:
+        for suffix in ('.json', '.jp2', '.answer', '.tmp'):
+            try:
+                os.remove(base + suffix)
+            except FileNotFoundError:
+                pass
+
+
 class ThreadingHTTPServerV6(ThreadingHTTPServer):
     address_family = socket.AF_INET6
     daemon_threads = True
@@ -976,6 +1050,43 @@ class Handler(BaseHTTPRequestHandler):
             # Remembered per connection: Ask and Upload share one TLS session,
             # so an Upload that never passed an Ask has nothing vouching for it.
             self._contacts_ok = True
+        elif ASK:
+            peer_cert = None
+            try:
+                peer_cert = self.connection.getpeercert(binary_form=True)
+            except (AttributeError, ValueError):
+                pass
+            # A check that cannot run proves nothing, and must not leave the
+            # sender waiting on an Ask that is never answered: ask as for a stranger.
+            try:
+                hashes = contacts.sender_hashes(ask.get('SenderRecordData'), peer_cert)
+            except Exception:
+                logging.exception('ask: could not check who the sender is; asking as for a stranger')
+                hashes = set()
+            if hashes & contacts.known_hashes():
+                logging.info('ask accepted without asking: sender is a known contact')
+                self._ask_ok = True
+            else:
+                if not ASK_SLOTS.acquire(blocking=False):
+                    answer = 'busy'
+                else:
+                    try:
+                        answer = ask_person(ask, files, items, hashes)
+                    finally:
+                        ASK_SLOTS.release()
+                if answer == 'busy':
+                    logging.warning('ask refused: %d already waiting for an answer', MAX_PENDING_ASKS)
+                elif answer == 'unanswered':
+                    logging.info('ask unanswered after %d s: declined', ASK_SECONDS)
+                else:
+                    logging.info('ask answered by the person: %s', answer)
+                if answer not in ('accept', 'always'):
+                    self.send_response(403)
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                # As for contacts only: the Upload rides the Ask's connection.
+                self._ask_ok = True
 
         # A `links` transfer is Ask-only: with SUPPORTS_URL (0x01) advertised,
         # iOS puts the URL straight into Items and sends no /Upload at all, so
@@ -1009,6 +1120,9 @@ class Handler(BaseHTTPRequestHandler):
         # the Upload itself carries no validation record to judge.
         if contacts.visibility() == 'contacts' and not getattr(self, '_contacts_ok', False):
             self.reject(403, 'contacts-only upload has no accepted Ask')
+            return
+        if ASK and not (getattr(self, '_ask_ok', False) or getattr(self, '_contacts_ok', False)):
+            self.reject(403, 'upload has no Ask the person accepted')
             return
         ctype = self.headers.get('Content-Type', '').split(';')[0].strip().lower()
         if ctype != 'application/x-dvzip':

@@ -233,3 +233,31 @@ class ContactsPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SenderHashesTests(ContactsPolicyTests):
+    """What ask mode offers to remember is only what the sender proved."""
+
+    def hashes(self, record, cert):
+        return contacts.sender_hashes(record, cert, ca_file=self.ca, untrusted=self.mid)
+
+    def test_a_bound_record_offers_its_hashes(self):
+        record = self.fx.record(["you@icloud.com", "+1 234 567 8901"], self.ACCOUNT)
+        self.assertEqual(self.hashes(record, self.fx.certificate(self.ACCOUNT)),
+                         {contacts.hash_identifier("you@icloud.com"),
+                          contacts.hash_identifier("12345678901")})
+
+    def test_a_replayed_record_offers_nothing(self):
+        record = self.fx.record(["you@icloud.com"], self.ACCOUNT)
+        self.assertEqual(self.hashes(record, self.fx.certificate(self.OTHER)), set())
+        self.assertEqual(self.hashes(record, self.fx.certificate(None, issued_by_ca=False)), set())
+
+    def test_no_record_offers_nothing(self):
+        self.assertEqual(self.hashes(None, self.fx.certificate(self.ACCOUNT)), set())
+
+    def test_a_known_senders_line_may_be_a_hash(self):
+        h = contacts.hash_identifier("you@icloud.com")
+        path = Path(self._tmp.name) / "known-senders"
+        path.write_text(f"# Your iPhone\n{h.upper()}\nfriend@example.com\n")
+        self.assertEqual(contacts.known_hashes(path),
+                         {h, contacts.hash_identifier("friend@example.com")})

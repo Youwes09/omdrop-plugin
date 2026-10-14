@@ -100,6 +100,11 @@ def known_hashes(path=None):
         return set()
     out = set()
     for line in path.read_text(errors="replace").splitlines():
+        # A line that is already a hash (64 hex digits) is taken as one: it is
+        # how a sender is added from a transfer, where only hashes are known.
+        if re.fullmatch(r"[0-9a-fA-F]{64}", line.strip()):
+            out.add(line.strip().lower())
+            continue
         entry = normalize(line)
         if entry:
             out.add(hash_identifier(entry))
@@ -214,6 +219,22 @@ def decide(record, peer_cert, known=None, ca_file=None, untrusted=None):
     if info["hashes"] & known:
         return ACCEPT, {"known_senders": len(known)}
     return REJECT_UNKNOWN, {"known_senders": len(known)}
+
+
+def sender_hashes(record, peer_cert, ca_file=None, untrusted=None):
+    """The hashed identifiers a sender has proved are theirs, or an empty set.
+
+    The same proof `decide` asks for -- an Apple-signed, unexpired record
+    bound to the connection's Apple-issued certificate -- without a list to
+    compare against.
+    """
+    info = verify_record(record, ca_file) if record else None
+    if info is None or info["expired"] or not peer_cert:
+        return set()
+    account = certificate_account(peer_cert, ca_file, untrusted)
+    if not account or account != info["account"]:
+        return set()
+    return info["hashes"]
 
 
 def decide_discovery(record, known=None, ca_file=None):

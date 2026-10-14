@@ -74,6 +74,7 @@ def dvzip(files):
 class ReceiverFixture(unittest.TestCase):
     visibility = "everyone"
     seed_identity = True
+    config = ""          # config.toml, when a test needs one
 
     @classmethod
     def setUpClass(cls):
@@ -86,6 +87,9 @@ class ReceiverFixture(unittest.TestCase):
         xdg = root / "config"
         (xdg / "omdrop").mkdir(parents=True)
         (xdg / "omdrop" / "visibility").write_text(cls.visibility + "\n")
+        if cls.config:
+            (xdg / "airdrop").mkdir()
+            (xdg / "airdrop" / "config.toml").write_text(cls.config)
         if cls.seed_identity:
             cls.keys.mkdir(parents=True)
             self_signed(cls.keys, "Existing Identity")

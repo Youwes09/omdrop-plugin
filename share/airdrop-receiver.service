@@ -61,6 +61,9 @@ ReadWritePaths=%h/Downloads %h/.omdrop
 # Opt-in protocol dumps (OMDROP_DEBUG=1) go to the runtime directory, never the
 # home directory: they can carry validation records. `-`: absent unless used.
 ReadWritePaths=-%t/omdrop/debug
+# With ask = true, transfers from unknown senders wait here for an answer.
+RuntimeDirectory=omdrop/asks
+RuntimeDirectoryMode=0700
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET6 AF_INET AF_UNIX AF_NETLINK
